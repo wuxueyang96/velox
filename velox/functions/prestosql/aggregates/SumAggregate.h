@@ -227,7 +227,7 @@ bool registerSum(const std::string& name) {
   signatures.push_back(exec::AggregateFunctionSignatureBuilder()
                        .returnType("double")
                        .argumentType("row(double,bigint)")
-                       .intermediateType("row(double,bigint")
+                       .intermediateType("row(double,bigint)")
                        .build());
 
   return exec::registerAggregateFunction(
