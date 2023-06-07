@@ -224,6 +224,12 @@ bool registerSum(const std::string& name) {
                              .build());
   }
 
+  signatures.push_back(exec::AggregateFunctionSignatureBuilder()
+                       .returnType("double")
+                       .argumentType("row(double,bigint)")
+                       .intermediateType("row(double,bigint")
+                       .build());
+
   return exec::registerAggregateFunction(
       name,
       std::move(signatures),
@@ -268,7 +274,9 @@ bool registerSum(const std::string& name) {
             // type is either int128_t or
             // UnscaledLongDecimalWithOverflowState.
             return std::make_unique<DecimalSumAggregate<int128_t>>(resultType);
-
+          case TypeKind::ROW:
+            // input type: row(bigint,double)
+            return std::make_unique<T<int64_t, double, double>>(resultType);
           default:
             VELOX_CHECK(
                 false,
