@@ -91,7 +91,7 @@ void registerSimpleFunctions(const std::string& prefix) {
   registerFunction<IsNanFunction, bool, double>({prefix + "is_nan"});
   registerFunction<NanFunction, double>({prefix + "nan"});
   registerFunction<RandFunction, double>({prefix + "rand", prefix + "random"});
-  registerUnaryIntegral<RandFunction>({prefix + "random"});
+  registerUnaryIntegral<RandFunction>({prefix + "rand", prefix + "random"});
   registerFunction<FromBaseFunction, int64_t, Varchar, int64_t>(
       {prefix + "from_base"});
   registerFunction<ToBaseFunction, Varchar, int64_t, int64_t>(
@@ -103,6 +103,10 @@ void registerSimpleFunctions(const std::string& prefix) {
       {prefix + "truncate"});
   registerFunction<BetaCDFFunction, double, double, double, double>(
       {prefix + "beta_cdf"});
+  registerFunction<NormalCDFFunction, double, double, double, double>(
+      {prefix + "normal_cdf"});
+  registerFunction<BinomialCDFFunction, double, int64_t, double, int64_t>(
+      {prefix + "binomial_cdf"});
 }
 
 } // namespace

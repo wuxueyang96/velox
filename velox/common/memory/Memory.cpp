@@ -35,7 +35,8 @@ MemoryManager::MemoryManager(const Options& options)
               options.arbitratorConfig.initMemoryPoolCapacity,
           .minMemoryPoolCapacityTransferSize =
               options.arbitratorConfig.minMemoryPoolCapacityTransferSize,
-      })),
+          .retryArbitrationFailure =
+              options.arbitratorConfig.retryArbitrationFailure})),
       alignment_(std::max(MemoryAllocator::kMinAlignment, options.alignment)),
       checkUsageLeak_(options.checkUsageLeak),
       poolDestructionCb_([&](MemoryPool* pool) { dropPool(pool); }),
@@ -45,13 +46,15 @@ MemoryManager::MemoryManager(const Options& options)
           MemoryPool::Kind::kAggregate,
           nullptr,
           nullptr,
+          nullptr,
           // NOTE: the default root memory pool has no capacity limit, and it is
           // used for system usage in production such as disk spilling.
           MemoryPool::Options{
               .alignment = alignment_,
               .capacity = kMaxMemory,
               .trackUsage =
-                  FLAGS_velox_enable_memory_usage_track_in_default_memory_pool})} {
+                  FLAGS_velox_enable_memory_usage_track_in_default_memory_pool,
+              .checkUsageLeak = options.checkUsageLeak})} {
   VELOX_CHECK_NOT_NULL(allocator_);
   VELOX_USER_CHECK_GE(capacity_, 0);
   MemoryAllocator::alignmentCheck(0, alignment_);
@@ -93,8 +96,13 @@ uint16_t MemoryManager::alignment() const {
 std::shared_ptr<MemoryPool> MemoryManager::addRootPool(
     const std::string& name,
     int64_t capacity,
-    bool trackUsage,
-    std::shared_ptr<MemoryReclaimer> reclaimer) {
+    std::unique_ptr<MemoryReclaimer> reclaimer) {
+  if (arbitrator_ != nullptr) {
+    VELOX_CHECK_NOT_NULL(
+        reclaimer,
+        "Memory reclaimer must be set when configured with memory arbitrator");
+  }
+
   std::string poolName = name;
   if (poolName.empty()) {
     static std::atomic<int64_t> poolId{0};
@@ -108,8 +116,8 @@ std::shared_ptr<MemoryPool> MemoryManager::addRootPool(
   } else {
     options.capacity = capacity;
   }
-  options.trackUsage = trackUsage;
-  options.reclaimer = std::move(reclaimer);
+  options.trackUsage = true;
+  options.checkUsageLeak = checkUsageLeak_;
 
   folly::SharedMutex::WriteHolder guard{mutex_};
   if (pools_.find(poolName) != pools_.end()) {
@@ -120,6 +128,7 @@ std::shared_ptr<MemoryPool> MemoryManager::addRootPool(
       poolName,
       MemoryPool::Kind::kAggregate,
       nullptr,
+      std::move(reclaimer),
       poolDestructionCb_,
       options);
   pools_.emplace(poolName, pool);
@@ -132,14 +141,13 @@ std::shared_ptr<MemoryPool> MemoryManager::addRootPool(
 
 std::shared_ptr<MemoryPool> MemoryManager::addLeafPool(
     const std::string& name,
-    bool threadSafe,
-    std::shared_ptr<MemoryReclaimer> reclaimer) {
+    bool threadSafe) {
   std::string poolName = name;
   if (poolName.empty()) {
     static std::atomic<int64_t> poolId{0};
     poolName = fmt::format("default_leaf_{}", poolId++);
   }
-  return defaultRoot_->addLeafChild(poolName, threadSafe, reclaimer);
+  return defaultRoot_->addLeafChild(poolName, threadSafe, nullptr);
 }
 
 bool MemoryManager::growPool(MemoryPool* pool, uint64_t incrementBytes) {
@@ -150,14 +158,8 @@ bool MemoryManager::growPool(MemoryPool* pool, uint64_t incrementBytes) {
   }
   // Holds a shared reference to each alive memory pool in 'pools_' to keep
   // their aliveness during the memory arbitration process.
-  std::vector<std::shared_ptr<MemoryPool>> candidates;
-  bool success;
-  {
-    folly::SharedMutex::ReadHolder guard{mutex_};
-    candidates = getAlivePoolsLocked();
-    success = arbitrator_->growMemory(pool, candidates, incrementBytes);
-  }
-  return success;
+  std::vector<std::shared_ptr<MemoryPool>> candidates = getAlivePools();
+  return arbitrator_->growMemory(pool, candidates, incrementBytes);
 }
 
 void MemoryManager::dropPool(MemoryPool* pool) {
@@ -227,13 +229,8 @@ std::string MemoryManager::toString() const {
 }
 
 std::vector<std::shared_ptr<MemoryPool>> MemoryManager::getAlivePools() const {
-  folly::SharedMutex::ReadHolder guard{mutex_};
-  return getAlivePoolsLocked();
-}
-
-std::vector<std::shared_ptr<MemoryPool>> MemoryManager::getAlivePoolsLocked()
-    const {
   std::vector<std::shared_ptr<MemoryPool>> pools;
+  folly::SharedMutex::ReadHolder guard{mutex_};
   pools.reserve(pools_.size());
   for (const auto& entry : pools_) {
     auto pool = entry.second.lock();

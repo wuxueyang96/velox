@@ -40,7 +40,7 @@ class MockMemoryPool : public velox::memory::MemoryPool {
       MemoryPool::Kind kind,
       std::shared_ptr<MemoryPool> parent,
       int64_t cap = std::numeric_limits<int64_t>::max())
-      : MemoryPool{name, kind, parent, {.alignment = velox::memory::MemoryAllocator::kMinAlignment}},
+      : MemoryPool{name, kind, parent, nullptr, {.alignment = velox::memory::MemoryAllocator::kMinAlignment}},
         capacity_(cap) {}
 
   int64_t capacity() const override {
@@ -150,7 +150,7 @@ class MockMemoryPool : public velox::memory::MemoryPool {
       const std::string& name,
       MemoryPool::Kind kind,
       bool /*unused*/,
-      std::shared_ptr<memory::MemoryReclaimer> /*unused*/) override {
+      std::unique_ptr<memory::MemoryReclaimer> /*unused*/) override {
     return std::make_shared<MockMemoryPool>(
         name, kind, parent, parent->capacity());
   }
@@ -163,21 +163,29 @@ class MockMemoryPool : public velox::memory::MemoryPool {
   MOCK_CONST_METHOD0(alignment, uint16_t());
 
   uint64_t freeBytes() const override {
-    VELOX_NYI("{} unsupported", __FUNCTION__);
+    VELOX_UNSUPPORTED("{} unsupported", __FUNCTION__);
   }
 
   uint64_t shrink(uint64_t /*unused*/) override {
-    VELOX_NYI("{} unsupported", __FUNCTION__);
+    VELOX_UNSUPPORTED("{} unsupported", __FUNCTION__);
   }
 
-  uint64_t grow(uint64_t /*unused*/) override {
-    VELOX_NYI("{} unsupported", __FUNCTION__);
+  uint64_t grow(uint64_t /*unused*/) noexcept override {
+    VELOX_UNSUPPORTED("{} unsupported", __FUNCTION__);
   }
 
   std::string toString() const override {
     return fmt::format(
         "Mock Memory Pool[{}]",
         velox::memory::MemoryAllocator::kindString(allocator_->kind()));
+  }
+
+  void abort() override {
+    VELOX_UNSUPPORTED("{} unsupported", __FUNCTION__);
+  }
+
+  bool aborted() const override {
+    VELOX_UNSUPPORTED("{} unsupported", __FUNCTION__);
   }
 
  private:

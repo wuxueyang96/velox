@@ -159,6 +159,7 @@ TEST_P(MemoryPoolTest, Ctor) {
         MemoryPool::Kind::kAggregate,
         nullptr,
         nullptr,
+        nullptr,
         MemoryPool::Options{.threadSafe = false}));
     ASSERT_EQ("fake_root", fakeRoot->name());
     ASSERT_EQ(
@@ -888,7 +889,7 @@ TEST_P(MemoryPoolTest, nonContiguousAllocate) {
 
 TEST_P(MemoryPoolTest, allocationFailStats) {
   auto manager = getMemoryManager(16 * KB);
-  auto pool = manager->addLeafPool("nonContiguousAllocateFail");
+  auto pool = manager->addLeafPool("allocationFailStats");
 
   EXPECT_THROW(pool->allocate(32 * KB), VeloxException);
   EXPECT_EQ(1, pool->stats().numAllocs);
@@ -1486,6 +1487,28 @@ TEST_P(MemoryPoolTest, transientContiguousAllocateFailure) {
     }
     allocator_->testingClearFailureInjection();
   }
+}
+
+TEST_P(MemoryPoolTest, contiguousAllocateExceedMemoryPoolLimit) {
+  const MachinePageCount kMaxNumPages = 1 << 10;
+  const auto kMemoryCapBytes = kMaxNumPages * AllocationTraits::kPageSize;
+  auto manager = getMemoryManager(1 << 30);
+  auto root =
+      manager->addRootPool("contiguousAllocateExceedLimit", kMemoryCapBytes);
+  auto pool =
+      root->addLeafChild("contiguousAllocateExceedLimit", isLeafThreadSafe_);
+
+  ContiguousAllocation allocation1;
+  pool->allocateContiguous(kMaxNumPages, allocation1);
+  ASSERT_FALSE(allocation1.empty());
+  ContiguousAllocation allocation2;
+  ASSERT_THROW(
+      pool->allocateContiguous(2 * kMaxNumPages, allocation2),
+      VeloxRuntimeError);
+  ASSERT_TRUE(allocation2.empty());
+  pool->freeContiguous(allocation1);
+  pool->allocateContiguous(kMaxNumPages, allocation2);
+  ASSERT_FALSE(allocation2.empty());
 }
 
 TEST_P(MemoryPoolTest, badNonContiguousAllocation) {
@@ -2099,9 +2122,6 @@ TEST_P(MemoryPoolTest, shrinkAndGrowAPIs) {
       ASSERT_ANY_THROW(rootPool->shrink(allocationSize));
       ASSERT_ANY_THROW(rootPool->shrink(kMaxMemory));
       leafPool->free(buffer, allocationSize);
-      ASSERT_ANY_THROW(leafPool->grow(allocationSize));
-      ASSERT_ANY_THROW(aggregationPool->grow(allocationSize));
-      ASSERT_ANY_THROW(rootPool->grow(allocationSize));
       continue;
     }
     ASSERT_EQ(rootPool->freeBytes(), capacity - allocationSize);
@@ -2183,6 +2203,62 @@ TEST_P(MemoryPoolTest, shrinkAndGrowAPIs) {
   }
 }
 
+TEST_P(MemoryPoolTest, memoryReclaimerSetCheck) {
+  auto manager = getMemoryManager(kMaxMemory);
+  // Valid use case: parent has memory reclaimer but child doesn't set.
+  {
+    auto root =
+        manager->addRootPool("", kMaxMemory, memory::MemoryReclaimer::create());
+    // Can't set more tha once.
+    VELOX_ASSERT_THROW(
+        root->setReclaimer(memory::MemoryReclaimer::create()), "");
+    VELOX_ASSERT_THROW(root->setReclaimer(nullptr), "");
+    auto aggrChild = root->addAggregateChild("aggregateChild");
+    aggrChild->setReclaimer(memory::MemoryReclaimer::create());
+    VELOX_ASSERT_THROW(
+        aggrChild->setReclaimer(memory::MemoryReclaimer::create()), "");
+    // Can't set empty reclaimer.
+    VELOX_ASSERT_THROW(aggrChild->setReclaimer(nullptr), "");
+    auto leafChild = root->addLeafChild("leafChild");
+    leafChild->setReclaimer(memory::MemoryReclaimer::create());
+    VELOX_ASSERT_THROW(
+        leafChild->setReclaimer(memory::MemoryReclaimer::create()), "");
+    VELOX_ASSERT_THROW(leafChild->setReclaimer(nullptr), "");
+  }
+  // Valid use case: both parent and child set memory reclaimer.
+  {
+    auto root =
+        manager->addRootPool("", kMaxMemory, memory::MemoryReclaimer::create());
+    auto aggrChild = root->addAggregateChild("aggregateChild");
+    auto leafChild = root->addLeafChild("leafChild");
+  }
+  // Valid use case: both parent and child don't set memory reclaimer.
+  {
+    auto root = manager->addRootPool("", kMaxMemory);
+    auto aggrChild = root->addAggregateChild("aggregateChild");
+    auto leafChild = root->addLeafChild("leafChild");
+    root->setReclaimer(memory::MemoryReclaimer::create());
+    VELOX_ASSERT_THROW(aggrChild->setReclaimer(nullptr), "");
+    aggrChild->setReclaimer(memory::MemoryReclaimer::create());
+    VELOX_ASSERT_THROW(leafChild->setReclaimer(nullptr), "");
+    leafChild->setReclaimer(memory::MemoryReclaimer::create());
+  }
+  // Invalid use case: parent has no memory reclaimer but child set.
+  {
+    auto root = manager->addRootPool("", kMaxMemory);
+    VELOX_ASSERT_THROW(
+        root->addAggregateChild(
+            "aggregateChild", memory::MemoryReclaimer::create()),
+        "");
+    VELOX_ASSERT_THROW(
+        root->addLeafChild(
+            "leafChild",
+            folly::Random::oneIn(2),
+            memory::MemoryReclaimer::create()),
+        "");
+  }
+}
+
 TEST_P(MemoryPoolTest, reclaimAPIsWithDefaultReclaimer) {
   MemoryManager manager;
   struct {
@@ -2215,7 +2291,6 @@ TEST_P(MemoryPoolTest, reclaimAPIsWithDefaultReclaimer) {
     auto pool = manager.addRootPool(
         "shrinkAPIs",
         kMaxMemory,
-        true,
         testData.hasReclaimer ? memory::MemoryReclaimer::create() : nullptr);
     pools.push_back(pool);
 
@@ -2275,30 +2350,24 @@ TEST_P(MemoryPoolTest, reclaimAPIsWithDefaultReclaimer) {
 
 TEST_P(MemoryPoolTest, usageTrackerOptionTest) {
   auto manager = getMemoryManager(8 * GB);
-  std::vector<bool> trackUsages = {false, true};
-  for (const auto trackUsage : trackUsages) {
-    auto root = manager->addRootPool(
-        "usageTrackerOptionTest", kMaxMemory, trackUsage, nullptr);
-    ASSERT_EQ(trackUsage, root->trackUsage());
-    auto child =
-        root->addLeafChild("usageTrackerOptionTest", isLeafThreadSafe_);
-    ASSERT_EQ(trackUsage, child->trackUsage());
-    ASSERT_EQ(child->threadSafe(), isLeafThreadSafe_);
-    ASSERT_TRUE(root->threadSafe());
-    ASSERT_EQ(
-        child->toString(),
-        fmt::format(
-            "Memory Pool[usageTrackerOptionTest LEAF {} {} {}]<unlimited capacity used 0B available 0B reservation [used 0B, reserved 0B, min 0B] counters [allocs 0, frees 0, reserves 0, releases 0, collisions 0])>",
-            useMmap_ ? "MMAP" : "MALLOC",
-            trackUsage ? "track-usage" : "no-usage-track",
-            isLeafThreadSafe_ ? "thread-safe" : "non-thread-safe"));
-    ASSERT_EQ(
-        root->toString(),
-        fmt::format(
-            "Memory Pool[usageTrackerOptionTest AGGREGATE {} {} thread-safe]<unlimited capacity used 0B available 0B reservation [used 0B, reserved 0B, min 0B] counters [allocs 0, frees 0, reserves 0, releases 0, collisions 0])>",
-            useMmap_ ? "MMAP" : "MALLOC",
-            trackUsage ? "track-usage" : "no-usage-track"));
-  }
+  auto root =
+      manager->addRootPool("usageTrackerOptionTest", kMaxMemory, nullptr);
+  ASSERT_TRUE(root->trackUsage());
+  auto child = root->addLeafChild("usageTrackerOptionTest", isLeafThreadSafe_);
+  ASSERT_TRUE(child->trackUsage());
+  ASSERT_EQ(child->threadSafe(), isLeafThreadSafe_);
+  ASSERT_TRUE(root->threadSafe());
+  ASSERT_EQ(
+      child->toString(),
+      fmt::format(
+          "Memory Pool[usageTrackerOptionTest LEAF {} track-usage {}]<unlimited capacity used 0B available 0B reservation [used 0B, reserved 0B, min 0B] counters [allocs 0, frees 0, reserves 0, releases 0, collisions 0])>",
+          useMmap_ ? "MMAP" : "MALLOC",
+          isLeafThreadSafe_ ? "thread-safe" : "non-thread-safe"));
+  ASSERT_EQ(
+      root->toString(),
+      fmt::format(
+          "Memory Pool[usageTrackerOptionTest AGGREGATE {} track-usage thread-safe]<unlimited capacity used 0B available 0B reservation [used 0B, reserved 0B, min 0B] counters [allocs 0, frees 0, reserves 0, releases 0, collisions 0])>",
+          useMmap_ ? "MMAP" : "MALLOC"));
 }
 
 TEST_P(MemoryPoolTest, statsAndToString) {
@@ -2744,6 +2813,300 @@ TEST_P(MemoryPoolTest, quantizedSize) {
     SCOPED_TRACE(testData.debugString());
     ASSERT_EQ(
         MemoryPool::quantizedSize(testData.inputSize), testData.quantizedSize);
+  }
+}
+
+namespace {
+class MockMemoryReclaimer : public MemoryReclaimer {
+ public:
+  static std::unique_ptr<MockMemoryReclaimer> create(bool doThrow) {
+    return std::unique_ptr<MockMemoryReclaimer>(
+        new MockMemoryReclaimer(doThrow));
+  }
+
+  void abort(MemoryPool* pool) override {
+    if (doThrow_) {
+      VELOX_MEM_POOL_ABORTED(pool);
+    }
+  }
+
+ private:
+  explicit MockMemoryReclaimer(bool doThrow) : doThrow_(doThrow) {}
+
+  const bool doThrow_;
+};
+} // namespace
+
+TEST_P(MemoryPoolTest, abortAPI) {
+  MemoryManager manager;
+  std::vector<uint64_t> capacities = {kMaxMemory, 0, 128 * MB};
+  for (const auto& capacity : capacities) {
+    SCOPED_TRACE(fmt::format("capacity {}", succinctBytes(capacity)));
+    {
+      auto rootPool = manager.addRootPool("abortAPI", capacity);
+      ASSERT_FALSE(rootPool->aborted());
+      VELOX_ASSERT_THROW(rootPool->abort(), "");
+      ASSERT_FALSE(rootPool->aborted());
+    }
+    // The root memory pool with no child pool and default memory reclaimer.
+    {
+      auto rootPool =
+          manager.addRootPool("abortAPI", capacity, MemoryReclaimer::create());
+      ASSERT_FALSE(rootPool->aborted());
+      {
+        rootPool->abort();
+        ASSERT_TRUE(rootPool->aborted());
+      }
+      ASSERT_TRUE(rootPool->aborted());
+      {
+        rootPool->abort();
+        ASSERT_TRUE(rootPool->aborted());
+      }
+      ASSERT_TRUE(rootPool->aborted());
+    }
+    // The root memory pool with child pools and default memory reclaimer.
+    {
+      auto rootPool =
+          manager.addRootPool("abortAPI", capacity, MemoryReclaimer::create());
+      ASSERT_FALSE(rootPool->aborted());
+      auto leafPool = rootPool->addLeafChild(
+          "leafAbortAPI", true, MemoryReclaimer::create());
+      ASSERT_FALSE(leafPool->aborted());
+      {
+        VELOX_ASSERT_THROW(leafPool->abort(), "");
+        ASSERT_TRUE(leafPool->aborted());
+        ASSERT_TRUE(rootPool->aborted());
+      }
+      ASSERT_TRUE(leafPool->aborted());
+      ASSERT_TRUE(rootPool->aborted());
+      auto aggregatePool = rootPool->addAggregateChild(
+          "aggregateAbortAPI", MemoryReclaimer::create());
+      ASSERT_TRUE(aggregatePool->aborted());
+      {
+        VELOX_ASSERT_THROW(aggregatePool->abort(), "");
+        ASSERT_TRUE(aggregatePool->aborted());
+        ASSERT_TRUE(leafPool->aborted());
+        ASSERT_TRUE(rootPool->aborted());
+      }
+      ASSERT_TRUE(aggregatePool->aborted());
+      ASSERT_TRUE(leafPool->aborted());
+      ASSERT_TRUE(rootPool->aborted());
+      {
+        VELOX_ASSERT_THROW(rootPool->abort(), "");
+        ASSERT_TRUE(aggregatePool->aborted());
+        ASSERT_TRUE(leafPool->aborted());
+        ASSERT_TRUE(rootPool->aborted());
+      }
+      ASSERT_TRUE(aggregatePool->aborted());
+      ASSERT_TRUE(leafPool->aborted());
+      ASSERT_TRUE(rootPool->aborted());
+    }
+    // The root memory pool with no child pool and memory reclaimer support at
+    // leaf.
+    {
+      auto rootPool =
+          manager.addRootPool("abortAPI", capacity, MemoryReclaimer::create());
+      ASSERT_FALSE(rootPool->aborted());
+      auto leafPool = rootPool->addLeafChild(
+          "leafAbortAPI", true, MockMemoryReclaimer::create(false));
+      ASSERT_FALSE(leafPool->aborted());
+      {
+        leafPool->abort();
+        ASSERT_TRUE(leafPool->aborted());
+        ASSERT_TRUE(rootPool->aborted());
+      }
+      ASSERT_TRUE(leafPool->aborted());
+      ASSERT_TRUE(rootPool->aborted());
+      auto aggregatePool = rootPool->addAggregateChild(
+          "aggregateAbortAPI", MemoryReclaimer::create());
+      ASSERT_TRUE(aggregatePool->aborted());
+      {
+        aggregatePool->abort();
+        ASSERT_TRUE(aggregatePool->aborted());
+        ASSERT_TRUE(leafPool->aborted());
+        ASSERT_TRUE(rootPool->aborted());
+      }
+      ASSERT_TRUE(aggregatePool->aborted());
+      ASSERT_TRUE(leafPool->aborted());
+      ASSERT_TRUE(rootPool->aborted());
+      {
+        rootPool->abort();
+        ASSERT_TRUE(aggregatePool->aborted());
+        ASSERT_TRUE(leafPool->aborted());
+        ASSERT_TRUE(rootPool->aborted());
+      }
+      ASSERT_TRUE(aggregatePool->aborted());
+      ASSERT_TRUE(leafPool->aborted());
+      ASSERT_TRUE(rootPool->aborted());
+    }
+  }
+}
+
+TEST_P(MemoryPoolTest, abort) {
+  MemoryManager manager;
+  int64_t capacity = 4 << 20;
+  // Abort throw from root.
+  {
+    auto rootPool = manager.addRootPool(
+        "abort", capacity, MockMemoryReclaimer::create(true));
+    ASSERT_FALSE(rootPool->aborted());
+    VELOX_ASSERT_THROW(rootPool->abort(), "");
+    ASSERT_TRUE(rootPool->aborted());
+  }
+  // Abort throw from leaf pool.
+  {
+    auto rootPool =
+        manager.addRootPool("abort", capacity, MemoryReclaimer::create());
+    ASSERT_FALSE(rootPool->aborted());
+    auto aggregatePool = rootPool->addAggregateChild(
+        "aggregateAbort", MemoryReclaimer::create());
+    ASSERT_FALSE(aggregatePool->aborted());
+    auto leafPool = rootPool->addLeafChild(
+        "leafAbort", true, MockMemoryReclaimer::create(true));
+    ASSERT_FALSE(leafPool->aborted());
+    VELOX_ASSERT_THROW(leafPool->abort(), "");
+    ASSERT_TRUE(leafPool->aborted());
+    ASSERT_TRUE(rootPool->aborted());
+    ASSERT_TRUE(aggregatePool->aborted());
+    VELOX_ASSERT_THROW(aggregatePool->abort(), "");
+    ASSERT_TRUE(leafPool->aborted());
+    ASSERT_TRUE(rootPool->aborted());
+    ASSERT_TRUE(aggregatePool->aborted());
+    VELOX_ASSERT_THROW(rootPool->abort(), "");
+    ASSERT_TRUE(leafPool->aborted());
+    ASSERT_TRUE(rootPool->aborted());
+    ASSERT_TRUE(aggregatePool->aborted());
+  }
+  // Abort throw from aggregate pool.
+  {
+    auto rootPool =
+        manager.addRootPool("abort", capacity, MemoryReclaimer::create());
+    ASSERT_FALSE(rootPool->aborted());
+    auto aggregatePool = rootPool->addAggregateChild(
+        "aggregateAbort", MemoryReclaimer::create());
+    ASSERT_FALSE(aggregatePool->aborted());
+    auto leafPool = rootPool->addLeafChild(
+        "leafAbort", true, MockMemoryReclaimer::create(true));
+    ASSERT_FALSE(leafPool->aborted());
+    VELOX_ASSERT_THROW(leafPool->abort(), "");
+    ASSERT_TRUE(leafPool->aborted());
+    ASSERT_TRUE(rootPool->aborted());
+    ASSERT_TRUE(aggregatePool->aborted());
+    VELOX_ASSERT_THROW(aggregatePool->abort(), "");
+    ASSERT_TRUE(leafPool->aborted());
+    ASSERT_TRUE(rootPool->aborted());
+    ASSERT_TRUE(aggregatePool->aborted());
+    VELOX_ASSERT_THROW(rootPool->abort(), "");
+    ASSERT_TRUE(leafPool->aborted());
+    ASSERT_TRUE(rootPool->aborted());
+    ASSERT_TRUE(aggregatePool->aborted());
+  }
+  // Abort from leaf with future wait.
+  {
+    auto rootPool =
+        manager.addRootPool("abort", capacity, MemoryReclaimer::create());
+    ASSERT_FALSE(rootPool->aborted());
+    auto aggregatePool = rootPool->addAggregateChild(
+        "aggregateAbort", MemoryReclaimer::create());
+    ASSERT_FALSE(aggregatePool->aborted());
+    auto leafPool = rootPool->addLeafChild(
+        "leafAbort", true, MockMemoryReclaimer::create(false));
+    ASSERT_FALSE(leafPool->aborted());
+
+    leafPool->abort();
+    ASSERT_TRUE(leafPool->aborted());
+    ASSERT_TRUE(aggregatePool->aborted());
+    ASSERT_TRUE(rootPool->aborted());
+  }
+  // Abort from aggregate with future wait.
+  {
+    auto rootPool =
+        manager.addRootPool("abort", capacity, MemoryReclaimer::create());
+    ASSERT_FALSE(rootPool->aborted());
+    auto aggregatePool = rootPool->addAggregateChild(
+        "aggregateAbort", MemoryReclaimer::create());
+    ASSERT_FALSE(aggregatePool->aborted());
+    auto leafPool = rootPool->addLeafChild(
+        "leafAbort", true, MockMemoryReclaimer::create(false));
+    ASSERT_FALSE(leafPool->aborted());
+
+    aggregatePool->abort();
+    ASSERT_TRUE(leafPool->aborted());
+    ASSERT_TRUE(aggregatePool->aborted());
+    ASSERT_TRUE(rootPool->aborted());
+  }
+  // Abort from root with future wait.
+  {
+    auto rootPool =
+        manager.addRootPool("abort", capacity, MemoryReclaimer::create());
+    ASSERT_FALSE(rootPool->aborted());
+    auto aggregatePool = rootPool->addAggregateChild(
+        "aggregateAbort", MemoryReclaimer::create());
+    ASSERT_FALSE(aggregatePool->aborted());
+    auto leafPool = rootPool->addLeafChild(
+        "leafAbort", true, MockMemoryReclaimer::create(false));
+    ASSERT_FALSE(leafPool->aborted());
+
+    rootPool->abort();
+    ASSERT_TRUE(rootPool->aborted());
+    ASSERT_TRUE(aggregatePool->aborted());
+    ASSERT_TRUE(rootPool->aborted());
+  }
+  // Allocation from an aborted memory pool.
+  std::vector<bool> hasReclaimers = {false, true};
+  for (bool hasReclaimer : hasReclaimers) {
+    SCOPED_TRACE(fmt::format("hasReclaimer {}", hasReclaimer));
+    {
+      auto rootPool = manager.addRootPool(
+          "abort",
+          capacity,
+          hasReclaimer ? MemoryReclaimer::create() : nullptr);
+      ASSERT_FALSE(rootPool->aborted());
+      auto aggregatePool = rootPool->addAggregateChild(
+          "aggregateAbort", hasReclaimer ? MemoryReclaimer::create() : nullptr);
+      ASSERT_FALSE(aggregatePool->aborted());
+      auto leafPool = rootPool->addLeafChild(
+          "leafAbort",
+          true,
+          hasReclaimer ? MockMemoryReclaimer::create(false) : nullptr);
+      ASSERT_FALSE(leafPool->aborted());
+
+      // Allocate some buffer from leaf.
+      void* buf1 = leafPool->allocate(128);
+      ASSERT_EQ(leafPool->currentBytes(), 128);
+
+      // Abort the pool.
+      ContinueFuture future;
+      if (!hasReclaimer) {
+        VELOX_ASSERT_THROW(leafPool->abort(), "");
+        VELOX_ASSERT_THROW(aggregatePool->abort(), "");
+        VELOX_ASSERT_THROW(rootPool->abort(), "");
+        ASSERT_FALSE(leafPool->aborted());
+        ASSERT_FALSE(aggregatePool->aborted());
+        ASSERT_FALSE(rootPool->aborted());
+        leafPool->free(buf1, 128);
+        buf1 = leafPool->allocate(capacity / 2);
+        leafPool->free(buf1, capacity / 2);
+        continue;
+      } else {
+        leafPool->abort();
+      }
+      ASSERT_TRUE(rootPool->aborted());
+      ASSERT_TRUE(aggregatePool->aborted());
+      ASSERT_TRUE(rootPool->aborted());
+
+      // Allocate more buffer to trigger reservation increment at the root.
+      { VELOX_ASSERT_THROW(leafPool->allocate(capacity / 2), ""); }
+      // Allocate more buffer to trigger memory arbitration at the root.
+      { VELOX_ASSERT_THROW(leafPool->allocate(capacity * 2), ""); }
+      // Allocate without trigger memory reservation increment.
+      void* buf2 = leafPool->allocate(128);
+      ASSERT_EQ(leafPool->currentBytes(), 256);
+      leafPool->free(buf1, 128);
+      leafPool->free(buf2, 128);
+      ASSERT_EQ(leafPool->currentBytes(), 0);
+      ASSERT_EQ(leafPool->capacity(), capacity);
+    }
   }
 }
 

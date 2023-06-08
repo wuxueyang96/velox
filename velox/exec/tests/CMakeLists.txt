@@ -57,16 +57,19 @@ add_executable(
   ProbeOperatorStateTest.cpp
   RoundRobinPartitionFunctionTest.cpp
   RowContainerTest.cpp
-  MemoryCapExceededTest.cpp
+  RowNumberTest.cpp
+  MarkDistinctTest.cpp
   SpillTest.cpp
   SpillOperatorGroupTest.cpp
   SpillerTest.cpp
+  SplitToStringTest.cpp
   SqlTest.cpp
   StreamingAggregationTest.cpp
   TableScanTest.cpp
   TableWriteTest.cpp
   TaskListenerTest.cpp
   TopNTest.cpp
+  TopNRowNumberTest.cpp
   UnorderedStreamReaderTest.cpp
   UnnestTest.cpp
   VectorHasherTest.cpp
@@ -219,3 +222,8 @@ target_link_libraries(velox_join_fuzzer velox_type velox_vector_fuzzer
 add_executable(velox_join_fuzzer_test JoinFuzzerTest.cpp)
 
 target_link_libraries(velox_join_fuzzer_test velox_join_fuzzer gtest gtest_main)
+
+add_executable(velox_aggregation_runner_test AggregationRunnerTest.cpp)
+
+target_link_libraries(velox_aggregation_runner_test velox_aggregation_fuzzer
+                      velox_aggregates velox_vector_test_lib gtest gtest_main)

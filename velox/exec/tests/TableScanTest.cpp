@@ -37,6 +37,18 @@ using namespace facebook::velox::exec;
 using namespace facebook::velox::common::test;
 using namespace facebook::velox::exec::test;
 
+namespace {
+void verifyCacheStats(
+    const FileHandleCacheStats& cacheStats,
+    size_t curSize,
+    size_t numHits,
+    size_t numLookups) {
+  EXPECT_EQ(cacheStats.curSize, curSize);
+  EXPECT_EQ(cacheStats.numHits, numHits);
+  EXPECT_EQ(cacheStats.numLookups, numLookups);
+}
+} // namespace
+
 class TableScanTest : public virtual HiveConnectorTestBase {
  protected:
   void SetUp() override {
@@ -213,12 +225,7 @@ TEST_F(TableScanTest, connectorStats) {
       std::dynamic_pointer_cast<connector::hive::HiveConnector>(
           connector::getConnector(kHiveConnectorId));
   EXPECT_NE(nullptr, hiveConnector);
-  auto cacheStats = hiveConnector->fileHandleCacheStats();
-  EXPECT_EQ(0, cacheStats.curSize);
-  EXPECT_EQ(0, cacheStats.pinnedSize);
-  EXPECT_EQ(0, cacheStats.numElements);
-  EXPECT_EQ(0, cacheStats.numHits);
-  EXPECT_EQ(0, cacheStats.numLookups);
+  verifyCacheStats(hiveConnector->fileHandleCacheStats(), 0, 0, 0);
 
   for (size_t i = 0; i < 99; i++) {
     auto vectors = makeVectors(10, 10);
@@ -229,17 +236,8 @@ TEST_F(TableScanTest, connectorStats) {
     assertQuery(plan, {filePath}, "SELECT * FROM tmp");
   }
 
-  cacheStats = hiveConnector->fileHandleCacheStats();
-  EXPECT_EQ(0, cacheStats.pinnedSize);
-  EXPECT_EQ(99, cacheStats.numElements);
-  EXPECT_EQ(0, cacheStats.numHits);
-  EXPECT_EQ(99, cacheStats.numLookups);
-
-  cacheStats = hiveConnector->clearFileHandleCache();
-  EXPECT_EQ(0, cacheStats.pinnedSize);
-  EXPECT_EQ(0, cacheStats.numElements);
-  EXPECT_EQ(0, cacheStats.numHits);
-  EXPECT_EQ(99, cacheStats.numLookups);
+  verifyCacheStats(hiveConnector->fileHandleCacheStats(), 99, 0, 99);
+  verifyCacheStats(hiveConnector->clearFileHandleCache(), 0, 0, 99);
 }
 
 TEST_F(TableScanTest, columnAliases) {
@@ -366,6 +364,79 @@ TEST_F(TableScanTest, subfieldPruningRowType) {
   for (int i = 0; i < d->size(); ++i) {
     ASSERT_TRUE(e->isNullAt(i) || d->isNullAt(i));
   }
+}
+
+TEST_F(TableScanTest, subfieldPruningRemainingFilterSubfieldsMissing) {
+  auto columnType = ROW({"a", "b", "c"}, {BIGINT(), BIGINT(), BIGINT()});
+  auto rowType = ROW({"e"}, {columnType});
+  auto vectors = makeVectors(10, 1'000, rowType);
+  auto filePath = TempFilePath::create();
+  writeToFile(filePath->path, vectors);
+  std::vector<common::Subfield> requiredSubfields;
+  requiredSubfields.emplace_back("e.c");
+  std::unordered_map<std::string, std::shared_ptr<connector::ColumnHandle>>
+      assignments;
+  assignments["e"] = std::make_shared<HiveColumnHandle>(
+      "e",
+      HiveColumnHandle::ColumnType::kRegular,
+      columnType,
+      std::move(requiredSubfields));
+
+  auto op = PlanBuilder()
+                .tableScan(
+                    rowType,
+                    makeTableHandle(
+                        SubfieldFilters{}, parseExpr("e.a is null", rowType)),
+                    assignments)
+                .planNode();
+  auto split = makeHiveConnectorSplit(filePath->path);
+  auto result = AssertQueryBuilder(op).split(split).copyResults(pool());
+
+  auto rows = result->as<RowVector>();
+  ASSERT_TRUE(rows);
+  ASSERT_EQ(rows->childrenSize(), 1);
+  auto e = rows->childAt(0)->as<RowVector>();
+  ASSERT_TRUE(e);
+  ASSERT_EQ(e->childrenSize(), 3);
+  auto a = e->childAt(0);
+  for (int i = 0; i < a->size(); ++i) {
+    ASSERT_TRUE(e->isNullAt(i) || a->isNullAt(i));
+  }
+}
+
+TEST_F(TableScanTest, subfieldPruningRemainingFilterRootFieldMissing) {
+  auto columnType = ROW({"a", "b", "c"}, {BIGINT(), BIGINT(), BIGINT()});
+  auto rowType = ROW({"d", "e"}, {BIGINT(), columnType});
+  auto vectors = makeVectors(10, 1'000, rowType);
+  auto filePath = TempFilePath::create();
+  writeToFile(filePath->path, vectors);
+  std::unordered_map<std::string, std::shared_ptr<connector::ColumnHandle>>
+      assignments;
+  assignments["d"] = std::make_shared<HiveColumnHandle>(
+      "d", HiveColumnHandle::ColumnType::kRegular, BIGINT());
+  auto op = PlanBuilder()
+                .tableScan(
+                    ROW({{"d", BIGINT()}}),
+                    makeTableHandle(
+                        SubfieldFilters{}, parseExpr("e.a is null", rowType)),
+                    assignments)
+                .planNode();
+  auto split = makeHiveConnectorSplit(filePath->path);
+  auto result = AssertQueryBuilder(op).split(split).copyResults(pool());
+  auto rows = result->as<RowVector>();
+  ASSERT_TRUE(rows);
+  ASSERT_EQ(rows->childrenSize(), 1);
+  auto d = rows->childAt(0)->asFlatVector<int64_t>();
+  ASSERT_TRUE(d);
+  int expectedSize = 0;
+  for (auto& vec : vectors) {
+    auto e = vec->as<RowVector>()->childAt(1)->as<RowVector>();
+    for (int i = 0; i < e->size(); ++i) {
+      expectedSize += e->isNullAt(i) || e->childAt(0)->isNullAt(i);
+    }
+  }
+  ASSERT_EQ(rows->size(), expectedSize);
+  ASSERT_EQ(d->size(), expectedSize);
 }
 
 TEST_F(TableScanTest, subfieldPruningMapType) {

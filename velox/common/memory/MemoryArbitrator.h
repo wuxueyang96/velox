@@ -20,6 +20,7 @@
 
 #include "velox/common/base/Exceptions.h"
 #include "velox/common/base/SuccinctPrinter.h"
+#include "velox/common/future/VeloxPromise.h"
 
 namespace facebook::velox::memory {
 
@@ -76,6 +77,14 @@ class MemoryArbitrator {
     /// The minimal memory capacity to transfer out of or into a memory pool
     /// during the memory arbitration.
     uint64_t minMemoryPoolCapacityTransferSize{32 << 20};
+
+    /// If true, handle the memory arbitration failure by aborting the memory
+    /// pool with most capacity and retry the memory arbitration, otherwise we
+    /// simply fails the memory arbitration requestor itself. This helps the
+    /// distributed query execution use case such as Prestissimo that fail the
+    /// same query on all the workers instead of a random victim query which
+    /// happens to trigger the failed memory arbitration.
+    bool retryArbitrationFailure{true};
   };
   static std::unique_ptr<MemoryArbitrator> create(const Config& config);
 
@@ -121,6 +130,8 @@ class MemoryArbitrator {
   struct Stats {
     /// The number of arbitration requests.
     uint64_t numRequests{0};
+    /// The number of aborted arbitration requests.
+    uint64_t numAborted{0};
     /// The number of arbitration request failures.
     uint64_t numFailures{0};
     /// The sum of all the arbitration request queue times in microseconds.
@@ -151,12 +162,14 @@ class MemoryArbitrator {
         capacity_(config.capacity),
         initMemoryPoolCapacity_(config.initMemoryPoolCapacity),
         minMemoryPoolCapacityTransferSize_(
-            config.minMemoryPoolCapacityTransferSize) {}
+            config.minMemoryPoolCapacityTransferSize),
+        retryArbitrationFailure_(config.retryArbitrationFailure) {}
 
   const Kind kind_;
   const uint64_t capacity_;
   const uint64_t initMemoryPoolCapacity_;
   const uint64_t minMemoryPoolCapacityTransferSize_;
+  const bool retryArbitrationFailure_;
 };
 
 std::ostream& operator<<(std::ostream& out, const MemoryArbitrator::Kind& kind);
@@ -183,7 +196,7 @@ class MemoryReclaimer {
  public:
   virtual ~MemoryReclaimer() = default;
 
-  static std::shared_ptr<MemoryReclaimer> create();
+  static std::unique_ptr<MemoryReclaimer> create();
 
   /// Invoked by the memory arbitrator before entering the memory arbitration
   /// processing. The default implementation does nothing but user can override
@@ -216,6 +229,13 @@ class MemoryReclaimer {
   /// reclaims all the reclaimable memory from the memory 'pool'. The function
   /// returns the actual reclaimed memory bytes.
   virtual uint64_t reclaim(MemoryPool* pool, uint64_t targetBytes);
+
+  /// Invoked by the memory arbitrator to abort memory 'pool' and the associated
+  /// query execution when encounters non-recoverable memory reclaim error or
+  /// fails to reclaim enough free capacity. The abort is a synchronous
+  /// operation and we expect most of used memory to be freed after the abort
+  /// completes.
+  virtual void abort(MemoryPool* pool);
 
  protected:
   MemoryReclaimer() = default;

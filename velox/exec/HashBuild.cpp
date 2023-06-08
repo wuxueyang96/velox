@@ -47,7 +47,15 @@ HashBuild::HashBuild(
     int32_t operatorId,
     DriverCtx* driverCtx,
     std::shared_ptr<const core::HashJoinNode> joinNode)
-    : Operator(driverCtx, nullptr, operatorId, joinNode->id(), "HashBuild"),
+    : Operator(
+          driverCtx,
+          nullptr,
+          operatorId,
+          joinNode->id(),
+          "HashBuild",
+          joinNode->canSpill(driverCtx->queryConfig())
+              ? driverCtx->makeSpillConfig(operatorId)
+              : std::nullopt),
       joinNode_(std::move(joinNode)),
       joinType_{joinNode_->joinType()},
       nullAware_{joinNode_->isNullAware()},
@@ -57,9 +65,6 @@ HashBuild::HashBuild(
   VELOX_CHECK(pool()->trackUsage());
   VELOX_CHECK_NOT_NULL(joinBridge_);
 
-  spillConfig_ = joinNode_->canSpill(driverCtx->queryConfig())
-      ? operatorCtx_->makeSpillConfig(Spiller::Type::kHashJoinBuild)
-      : std::nullopt;
   spillGroup_ = spillEnabled()
       ? operatorCtx_->task()->getSpillOperatorGroupLocked(
             operatorCtx_->driverCtx()->splitGroupId, planNodeId())
@@ -115,8 +120,8 @@ void HashBuild::setupTable() {
   std::vector<std::unique_ptr<VectorHasher>> keyHashers;
   keyHashers.reserve(numKeys);
   for (vector_size_t i = 0; i < numKeys; ++i) {
-    keyHashers.emplace_back(std::make_unique<VectorHasher>(
-        tableType_->childAt(i), keyChannels_[i]));
+    keyHashers.emplace_back(
+        VectorHasher::create(tableType_->childAt(i), keyChannels_[i]));
   }
 
   const auto numDependents = tableType_->size() - numKeys;
@@ -701,6 +706,15 @@ bool HashBuild::finishHashBuild() {
     return false;
   }
 
+  auto promisesGuard = folly::makeGuard([&]() {
+    // Realize the promises so that the other Drivers (which were not
+    // the last to finish) can continue from the barrier and finish.
+    peers.clear();
+    for (auto& promise : promises) {
+      promise.setValue();
+    }
+  });
+
   std::vector<std::unique_ptr<BaseHashTable>> otherTables;
   otherTables.reserve(peers.size());
   SpillPartitionSet spillPartitions;
@@ -769,12 +783,6 @@ bool HashBuild::finishHashBuild() {
     }
   }
 
-  // Realize the promises so that the other Drivers (which were not
-  // the last to finish) can continue from the barrier and finish.
-  peers.clear();
-  for (auto& promise : promises) {
-    promise.setValue();
-  }
   return true;
 }
 
@@ -988,12 +996,17 @@ bool HashBuild::testingTriggerSpill() {
 void HashBuild::reclaim(uint64_t /*unused*/) {
   VELOX_CHECK(canReclaim());
   auto* driver = operatorCtx_->driver();
-  VELOX_CHECK(!driver->state().isOnThread() || driver->state().isSuspended);
-  VELOX_CHECK(driver->task()->pauseRequested());
 
-  /// NOTE: a hash build operator is reclaimable if it is in the middle of table
-  /// build processing and is not under non-reclaimable execution section.
+  TestValue::adjust("facebook::velox::exec::HashBuild::reclaim", this);
+
+  // NOTE: a hash build operator is reclaimable if it is in the middle of table
+  // build processing and is not under non-reclaimable execution section.
   if ((state_ != State::kRunning) || nonReclaimableSection_) {
+    // TODO: add stats to record the non-reclaimable case and reduce the log
+    // frequency if it is too verbose.
+    LOG(WARNING) << "Can't reclaim from hash build operator, state_["
+                 << stateName(state_) << "], nonReclaimableSection_["
+                 << nonReclaimableSection_ << "], " << toString();
     return;
   }
 
@@ -1004,8 +1017,15 @@ void HashBuild::reclaim(uint64_t /*unused*/) {
   for (auto* op : operators) {
     HashBuild* buildOp = dynamic_cast<HashBuild*>(op);
     VELOX_CHECK_NOT_NULL(buildOp);
-    if (!buildOp->canReclaim() || (buildOp->state_ != State::kRunning) ||
+    VELOX_CHECK(buildOp->canReclaim());
+    if ((buildOp->state_ != State::kRunning) ||
         buildOp->nonReclaimableSection_) {
+      // TODO: add stats to record the non-reclaimable case and reduce the log
+      // frequency if it is too verbose.
+      LOG(WARNING) << "Can't reclaim from hash build operator, state_["
+                   << stateName(buildOp->state_) << "], nonReclaimableSection_["
+                   << buildOp->nonReclaimableSection_ << "], "
+                   << buildOp->toString();
       return;
     }
   }
@@ -1024,5 +1044,14 @@ void HashBuild::reclaim(uint64_t /*unused*/) {
     // Release the minimum reserved memory.
     op->pool()->release();
   }
+}
+
+void HashBuild::close() {
+  Operator::close();
+
+  // Free up major memory usage.
+  joinBridge_.reset();
+  spiller_.reset();
+  table_.reset();
 }
 } // namespace facebook::velox::exec

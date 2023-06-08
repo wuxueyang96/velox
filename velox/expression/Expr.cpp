@@ -110,6 +110,15 @@ bool hasConditionals(Expr* expr) {
 
   return false;
 }
+
+void checkOrSetEmptyResult(
+    const TypePtr& type,
+    memory::MemoryPool* pool,
+    VectorPtr& result) {
+  if (!result) {
+    result = BaseVector::createNullConstant(type, 0, pool);
+  }
+}
 } // namespace
 
 Expr::Expr(
@@ -396,8 +405,7 @@ void Expr::evalSimplified(
     EvalCtx& context,
     VectorPtr& result) {
   if (!rows.hasSelections()) {
-    // empty input, return an empty vector of the right type
-    result = BaseVector::createNullConstant(type(), 0, context.pool());
+    checkOrSetEmptyResult(type(), context.pool(), result);
     return;
   }
 
@@ -481,8 +489,9 @@ class ExprExceptionContext {
  public:
   ExprExceptionContext(
       const Expr* FOLLY_NONNULL expr,
-      const RowVector* FOLLY_NONNULL vector)
-      : expr_(expr), vector_(vector) {}
+      const RowVector* FOLLY_NONNULL vector,
+      const ExprSet* FOLLY_NULLABLE parentExprSet)
+      : expr_(expr), vector_(vector), parentExprSet_(parentExprSet) {}
 
   /// Persist data and sql on disk. Data will be persisted in $basePath/vector
   /// and sql will be persisted in $basePath/sql
@@ -521,6 +530,30 @@ class ExprExceptionContext {
       sqlPath_ = e.what();
       return;
     }
+
+    if (parentExprSet_ != nullptr) {
+      std::stringstream allSql;
+      auto exprs = parentExprSet_->exprs();
+      for (int i = 0; i < exprs.size(); ++i) {
+        if (i > 0) {
+          allSql << ", ";
+        }
+        allSql << exprs[i]->toSql();
+      }
+      try {
+        auto sqlPathOpt = common::generateTempFilePath(basePath, "allExprSql");
+        if (!sqlPathOpt.has_value()) {
+          allExprSqlPath_ =
+              "Failed to create file for saving all SQL expressions.";
+          return;
+        }
+        allExprSqlPath_ = sqlPathOpt.value();
+        saveStringToFile(allSql.str(), allExprSqlPath_.c_str());
+      } catch (std::exception& e) {
+        allExprSqlPath_ = e.what();
+        return;
+      }
+    }
   }
 
   const Expr* FOLLY_NONNULL expr() const {
@@ -539,6 +572,10 @@ class ExprExceptionContext {
     return sqlPath_;
   }
 
+  const std::string& allExprSqlPath() const {
+    return allExprSqlPath_;
+  }
+
  private:
   /// The expression.
   const Expr* FOLLY_NONNULL expr_;
@@ -548,6 +585,9 @@ class ExprExceptionContext {
   /// the time of exception.
   const RowVector* FOLLY_NONNULL vector_;
 
+  // The parent ExprSet that is executing this expression.
+  const ExprSet* FOLLY_NULLABLE parentExprSet_;
+
   /// Path of the file storing the serialized 'vector'. Used to avoid
   /// serializing vector repeatedly in cases when multiple rows generate
   /// exceptions. This happens when exceptions are suppressed by TRY/AND/OR.
@@ -556,6 +596,11 @@ class ExprExceptionContext {
   /// Path of the file storing the expression SQL. Used to avoid writing SQL
   /// repeatedly in cases when multiple rows generate exceptions.
   std::string sqlPath_{""};
+
+  /// Path of the file storing the SQL for all expressions in the ExprSet that
+  /// was executing this expression. Useful if the bug that caused the error was
+  /// encountered due to some mutation from running the other expressions.
+  std::string allExprSqlPath_{"N/A"};
 };
 
 /// Used to generate context for an error occurred while evaluating
@@ -592,10 +637,11 @@ std::string onTopLevelException(VeloxException::Type exceptionType, void* arg) {
   context->persistDataAndSql(basePath);
 
   return fmt::format(
-      "{}. Input data: {}. SQL expression: {}.",
+      "{}. Input data: {}. SQL expression: {}. All SQL expressions: {}.",
       context->expr()->toString(),
       context->dataPath(),
-      context->sqlPath());
+      context->sqlPath(),
+      context->allExprSqlPath());
 }
 
 /// Used to generate context for an error occurred while evaluating
@@ -610,7 +656,7 @@ void Expr::evalFlatNoNulls(
     const SelectivityVector& rows,
     EvalCtx& context,
     VectorPtr& result,
-    bool topLevel) {
+    const ExprSet* parentExprSet) {
   if (shouldEvaluateSharedSubexp()) {
     evaluateSharedSubexpr(
         rows,
@@ -619,10 +665,10 @@ void Expr::evalFlatNoNulls(
         [&](const SelectivityVector& rows,
             EvalCtx& context,
             VectorPtr& result) {
-          evalFlatNoNullsImpl(rows, context, result, topLevel);
+          evalFlatNoNullsImpl(rows, context, result, parentExprSet);
         });
   } else {
-    evalFlatNoNullsImpl(rows, context, result, topLevel);
+    evalFlatNoNullsImpl(rows, context, result, parentExprSet);
   }
 }
 
@@ -630,11 +676,16 @@ void Expr::evalFlatNoNullsImpl(
     const SelectivityVector& rows,
     EvalCtx& context,
     VectorPtr& result,
-    bool topLevel) {
-  ExprExceptionContext exprExceptionContext{this, context.row()};
+    const ExprSet* parentExprSet) {
+  ExprExceptionContext exprExceptionContext{this, context.row(), parentExprSet};
   ExceptionContextSetter exceptionContext(
-      {topLevel ? onTopLevelException : onException,
-       topLevel ? (void*)&exprExceptionContext : this});
+      {parentExprSet ? onTopLevelException : onException,
+       parentExprSet ? (void*)&exprExceptionContext : this});
+
+  if (!rows.hasSelections()) {
+    checkOrSetEmptyResult(type(), context.pool(), result);
+    return;
+  }
 
   if (isSpecialForm()) {
     evalSpecialFormWithStats(rows, context, result);
@@ -669,23 +720,22 @@ void Expr::eval(
     const SelectivityVector& rows,
     EvalCtx& context,
     VectorPtr& result,
-    bool topLevel) {
+    const ExprSet* parentExprSet) {
   if (supportsFlatNoNullsFastPath_ && context.throwOnError() &&
       context.inputFlatNoNulls() && rows.countSelected() < 1'000) {
-    evalFlatNoNulls(rows, context, result, topLevel);
+    evalFlatNoNulls(rows, context, result, parentExprSet);
     return;
   }
 
   // Make sure to include current expression in the error message in case of an
   // exception.
-  ExprExceptionContext exprExceptionContext{this, context.row()};
+  ExprExceptionContext exprExceptionContext{this, context.row(), parentExprSet};
   ExceptionContextSetter exceptionContext(
-      {topLevel ? onTopLevelException : onException,
-       topLevel ? (void*)&exprExceptionContext : this});
+      {parentExprSet ? onTopLevelException : onException,
+       parentExprSet ? (void*)&exprExceptionContext : this});
 
   if (!rows.hasSelections()) {
-    // empty input, return an empty vector of the right type
-    result = BaseVector::createNullConstant(type(), 0, context.pool());
+    checkOrSetEmptyResult(type(), context.pool(), result);
     return;
   }
 
@@ -1004,6 +1054,8 @@ void Expr::addNulls(
   }
 
   if (result->size() < rows.end()) {
+    BaseVector::ensureWritable(
+        SelectivityVector::empty(), type, context.pool(), result);
     result->resize(rows.end());
   }
 
@@ -1023,8 +1075,7 @@ void Expr::evalWithNulls(
     EvalCtx& context,
     VectorPtr& result) {
   if (!rows.hasSelections()) {
-    // empty input, return an empty vector of the right type
-    result = BaseVector::createNullConstant(type(), 0, context.pool());
+    checkOrSetEmptyResult(type(), context.pool(), result);
     return;
   }
 
@@ -1236,8 +1287,7 @@ void Expr::evalAll(
     EvalCtx& context,
     VectorPtr& result) {
   if (!rows.hasSelections()) {
-    // empty input, return an empty vector of the right type
-    result = BaseVector::createNullConstant(type(), 0, context.pool());
+    checkOrSetEmptyResult(type(), context.pool(), result);
     return;
   }
 
@@ -1645,7 +1695,7 @@ void ExprSet::eval(
   }
 
   for (int32_t i = begin; i < end; ++i) {
-    exprs_[i]->eval(rows, context, result[i], true /*topLevel*/);
+    exprs_[i]->eval(rows, context, result[i], this);
   }
 }
 
