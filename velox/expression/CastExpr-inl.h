@@ -234,14 +234,14 @@ void CastExpr::applyDoubleToDecimal(
             error);
         if (!error.empty()) {
           if (setNullInResultAtError()) {
-            rawResults->setNull(row, true);
+            castResult->setNull(row, true);
           } else {
             context.setVeloxExceptionError(row, makeBadCastException(toType, input, row, error));
           }
         } else if (rescaledValue.has_value()) {
           rawResults[row] = rescaledValue.value();
         } else {
-          rawResults->setNull(row, true);
+          castResult->setNull(row, true);
         }
       });
 }
